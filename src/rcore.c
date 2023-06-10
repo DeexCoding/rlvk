@@ -209,8 +209,10 @@
 #endif
 
 #if defined(PLATFORM_DESKTOP)
-    #define GLFW_INCLUDE_NONE       // Disable the standard OpenGL header inclusion on GLFW3
-                                    // NOTE: Already provided by rlgl implementation (on glad.h)
+    #define GLFW_INCLUDE_VULKAN     // Let GLFW include vulkan.
+                                    // NOTE: Vulkan HAS TO be included either before GLFW or by GLFW for
+                                    //       the vulkan GLFW extensions to work properly
+
     #include "GLFW/glfw3.h"         // GLFW3 library: Windows, OpenGL context and Input management
                                     // NOTE: GLFW3 already includes gl.h (OpenGL) headers
 
@@ -754,7 +756,7 @@ void InitWindow(int width, int height, const char *title)
 
     TRACELOG(LOG_INFO, "Supported raylib modules:");
     TRACELOG(LOG_INFO, "    > rcore:..... loaded (mandatory)");
-    TRACELOG(LOG_INFO, "    > rlgl:...... loaded (mandatory)");
+    TRACELOG(LOG_INFO, "    > rlvk:...... loaded (mandatory)");
 #if defined(SUPPORT_MODULE_RSHAPES)
     TRACELOG(LOG_INFO, "    > rshapes:... loaded (optional)");
 #else
@@ -1244,7 +1246,7 @@ void ToggleFullscreen(void)
 
     // Try to enable GPU V-Sync, so frames are limited to screen refresh rate (60Hz -> 60 FPS)
     // NOTE: V-Sync can be enabled by graphic driver configuration
-    if (CORE.Window.flags & FLAG_VSYNC_HINT) glfwSwapInterval(1);
+    if (CORE.Window.flags & FLAG_VSYNC_HINT) rlSetVSync(true);
 #endif
 #if defined(PLATFORM_WEB)
 /*
@@ -1364,7 +1366,7 @@ void SetWindowState(unsigned int flags)
     // State change: FLAG_VSYNC_HINT
     if (((CORE.Window.flags & FLAG_VSYNC_HINT) != (flags & FLAG_VSYNC_HINT)) && ((flags & FLAG_VSYNC_HINT) > 0))
     {
-        glfwSwapInterval(1);
+        rlSetVSync(true);
         CORE.Window.flags |= FLAG_VSYNC_HINT;
     }
 
@@ -1474,7 +1476,7 @@ void ClearWindowState(unsigned int flags)
     // State change: FLAG_VSYNC_HINT
     if (((CORE.Window.flags & FLAG_VSYNC_HINT) > 0) && ((flags & FLAG_VSYNC_HINT) > 0))
     {
-        glfwSwapInterval(0);
+        rlSetVSync(false);
         CORE.Window.flags &= ~FLAG_VSYNC_HINT;
     }
 
@@ -4256,12 +4258,12 @@ static bool InitGraphicsDevice(int width, int height)
     glfwSetScrollCallback(CORE.Window.handle, MouseScrollCallback);
     glfwSetCursorEnterCallback(CORE.Window.handle, CursorEnterCallback);
 
-    glfwMakeContextCurrent(CORE.Window.handle);
+    //glfwMakeContextCurrent(CORE.Window.handle);
 
 #if !defined(PLATFORM_WEB)
     glfwSetInputMode(CORE.Window.handle, GLFW_LOCK_KEY_MODS, GLFW_TRUE);    // Enable lock keys modifiers (CAPS, NUM)
 
-    glfwSwapInterval(0);        // No V-Sync by default
+    rlSetVSync(false);        // No V-Sync by default
 #endif
 
     // Try to enable GPU V-Sync, so frames are limited to screen refresh rate (60Hz -> 60 FPS)
@@ -4269,7 +4271,7 @@ static bool InitGraphicsDevice(int width, int height)
     if (CORE.Window.flags & FLAG_VSYNC_HINT)
     {
         // WARNING: It seems to hit a critical render path in Intel HD Graphics
-        glfwSwapInterval(1);
+        rlSetVSync(true);
         TRACELOG(LOG_INFO, "DISPLAY: Trying to enable VSYNC");
     }
 
@@ -4926,7 +4928,7 @@ void WaitTime(double seconds)
 void SwapScreenBuffer(void)
 {
 #if defined(PLATFORM_DESKTOP) || defined(PLATFORM_WEB)
-    glfwSwapBuffers(CORE.Window.handle);
+    rlSwapScreenBuffers();
 #endif
 
 #if defined(PLATFORM_ANDROID) || defined(PLATFORM_RPI) || defined(PLATFORM_DRM)

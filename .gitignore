@@ -104,3 +104,6 @@ docgen_tmp/
 
 # Parser stuff
 parser/raylib_parser
+
+# Ignore VSCode files
+.vscode
