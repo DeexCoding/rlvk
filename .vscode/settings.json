@@ -1,6 +1,0 @@
-{
-    "files.associations": {
-        "rlgl.h": "c",
-        "*.m": "c"
-    }
-}
