@@ -12,11 +12,12 @@
 #ifndef RLGL_H
 #define RLGL_H
 
-//#define RLVK_ENABLE_VULKAN_VALIDATION_LAYER //TODO: Remove!!!!
+#define RLVK_ENABLE_VULKAN_VALIDATION_LAYER //TODO: Remove!!!!
 
 #define NULL 0 //For some reason the compiler was complaining it can't find NULL so whatever it's here
 
 #include <vulkan/vulkan.h>
+#include <shaderc/shaderc.h>
 
 #define RLGL_VERSION  "4.5"
 
@@ -159,13 +160,24 @@ typedef struct rlRenderBatch {
 
 
 typedef struct rlvkData {
+
+    bool inited;
+    bool vSync;
+
     //VULKAN DATA
     
     VkInstance vkInstance;
 #ifdef RLVK_ENABLE_VULKAN_VALIDATION_LAYER
     VkDebugUtilsMessengerEXT* debugMessenger;
 #endif
+    VkSurfaceKHR surface;
     VkDevice device;
+    VkSwapchainKHR swapChain;
+    uint32_t swapChainImageCount;
+    VkImageView* swapChainImageViews;
+    VkRenderPass renderPass;
+    VkPipelineLayout pipelineLayout;
+    VkPipeline graphicsPipeline;
 
     //-----------
 
@@ -486,9 +498,6 @@ void rlSetFramebufferHeight(int height)
     //TODO
 }
 
-const char** glfwGetRequiredInstanceExtensions(uint32_t *count); //TODO: Ugly hack, should be done in a better way
-
-
 #ifdef RLVK_ENABLE_VULKAN_VALIDATION_LAYER
 static VKAPI_ATTR VkBool32 VKAPI_CALL rlVulkanDebugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
@@ -509,7 +518,16 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL rlVulkanDebugCallback(
 }
 #endif
 
-void rlglInit(int width, int height)
+
+static void rlLoadShaderDefault(void)
+{
+
+}
+
+//TODO: These are ugly hacks
+const char** glfwGetRequiredInstanceExtensions(uint32_t* count);
+
+void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
 {
     VkApplicationInfo appInfo = 
     {
@@ -535,7 +553,7 @@ void rlglInit(int width, int height)
 #ifdef PLATFORM_APPLE
     //According to https://vulkan.lunarg.com/doc/sdk/1.3.216.0/mac/getting_started.html
     //Beginning with the 1.3.216 Vulkan SDK, the VK_KHR_PORTABILITY_subset extension is mandatory for MoltenVK (Vulkan porting to metal)
-    vulkanExtensions = realloc(vulkanExtensions, ++vulkanExtensionCount * sizeof(char*));
+    vulkanExtensions = RL_REALLOC(vulkanExtensions, ++vulkanExtensionCount * sizeof(char*));
     vulkanExtensions[vulkanExtensionCount - 1] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
     createInfoFlags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
@@ -543,7 +561,7 @@ void rlglInit(int width, int height)
     //TODO: Maybe print available Vulkan extensions? Raylib likes printing stuff like this to the console
 
 #ifdef RLVK_ENABLE_VULKAN_VALIDATION_LAYER
-    vulkanExtensions = realloc(vulkanExtensions, ++vulkanExtensionCount * sizeof(char*));
+    vulkanExtensions = RL_REALLOC(vulkanExtensions, ++vulkanExtensionCount * sizeof(char*));
     vulkanExtensions[vulkanExtensionCount - 1] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     
     //TODO: Check for validation layer support?
@@ -610,8 +628,16 @@ void rlglInit(int width, int height)
     }
 #endif
 
+    //Platform dependent surface creation
+    if (glfwCreateWindowSurface(RLVK.vkInstance, windowHandle, 0, &RLVK.surface) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "GLFW, Vulkan: Failed to create a window surface");
+        return;
+    }
+
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     uint32_t graphicsFamily = 0;
+    uint32_t presentFamily = 0;
 
     uint32_t physicalDeviceCount = 0;
     vkEnumeratePhysicalDevices(RLVK.vkInstance, &physicalDeviceCount, 0);
@@ -622,10 +648,17 @@ void rlglInit(int width, int height)
         return;
     }
 
+    uint32_t requiredDeviceExtensionCount = 1;
+    char* requiredDeviceExtensions[] =
+    {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME
+    };
+
     //We can only get the devices from Vulkan. There is no feature to let Vulkan pick a device.
     //So we will use a custom scoring system to pick the best device.
     {
         uint32_t* physicaDeviceGraphicsFamilies = RL_MALLOC(physicalDeviceCount * sizeof(uint32_t));
+        uint32_t* physicaDevicePresentFamilies = RL_MALLOC(physicalDeviceCount * sizeof(uint32_t));
         int32_t* physicaDeviceScores = RL_MALLOC(physicalDeviceCount * sizeof(int32_t));
         VkPhysicalDevice* physicalDevices = RL_MALLOC(physicalDeviceCount * sizeof(VkPhysicalDevice));
         vkEnumeratePhysicalDevices(RLVK.vkInstance, &physicalDeviceCount, physicalDevices);
@@ -647,6 +680,7 @@ void rlglInit(int width, int height)
             vkGetPhysicalDeviceQueueFamilyProperties(*device, &queueFamilyCount, queueFamilies);
 
             bool foundGraphicsFamily = false;
+            bool foundPresentFamily = false;
 
             for (uint32_t j = 0; j < queueFamilyCount; ++j)
             {
@@ -656,19 +690,94 @@ void rlglInit(int width, int height)
                 {
                     foundGraphicsFamily = true;
                     physicaDeviceGraphicsFamilies[i] = j;
+                }
+
+                VkBool32 presentSupport = false;
+                vkGetPhysicalDeviceSurfaceSupportKHR(*device, j, RLVK.surface, &presentSupport);
+
+                if (presentSupport)
+                {
+                    foundPresentFamily = true;
+                    physicaDevicePresentFamilies[i] = j;
+                }
+                
+                if (foundPresentFamily && foundGraphicsFamily)
+                {
                     break;
                 }
             }
 
-            if (!foundGraphicsFamily)
+            RL_FREE(queueFamilies);
+
+            if (!foundGraphicsFamily || !foundPresentFamily)
             {
                 physicaDeviceScores[i] = 0;
                 continue;
             }
 
-            ++(physicaDeviceScores[i]); //Incerement by 1, since 0 means the device is not suitable
+            uint32_t extensionCount;
+            vkEnumerateDeviceExtensionProperties(*device, 0, &extensionCount, 0);
+
+            VkExtensionProperties* availableExtensions = RL_MALLOC(extensionCount * sizeof(VkExtensionProperties));
+            vkEnumerateDeviceExtensionProperties(*device, 0, &extensionCount, availableExtensions);
+
+            bool* requiredExtensionAvailables = RL_MALLOC(requiredDeviceExtensionCount * sizeof(bool));
+
+            for (uint32_t j = 0; j < requiredDeviceExtensionCount; ++j)
+            {
+                requiredExtensionAvailables[j] = false;
+            }
+            
+            for (uint32_t j = 0; j < extensionCount; ++j)
+            {
+                for (uint32_t k = 0; k < requiredDeviceExtensionCount; ++k)
+                {
+                    if (strcmp(availableExtensions[j].extensionName, requiredDeviceExtensions[k]) == 0)
+                    {
+                        requiredExtensionAvailables[k] = true;
+                    }
+                }
+            }
+            
+            bool extensionsSupported = true;
+
+            for (uint32_t j = 0; j < requiredDeviceExtensionCount; ++j)
+            {
+                if (!requiredExtensionAvailables[j])
+                {
+                    extensionsSupported = false;
+                    break;
+                }
+            }
+
+            if (!extensionsSupported)
+            {
+                physicaDeviceScores[i] = 0;
+                continue;
+            }
+            
+            uint32_t surfaceFormatCount;
+            vkGetPhysicalDeviceSurfaceFormatsKHR(*device, RLVK.surface, &surfaceFormatCount, 0);
+            
+            uint32_t presentModeCount;
+            vkGetPhysicalDeviceSurfacePresentModesKHR(*device, RLVK.surface, &presentModeCount, 0);
+
+            if (surfaceFormatCount == 0 || presentModeCount == 0)
+            {
+                physicaDeviceScores[i] = 0;
+                continue;
+            }
+
+            physicaDeviceScores[i] = 1; //Initalize memory to 1, since 0 means the device is not suitable
             
             if (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+            {
+                physicaDeviceScores[i] += 1000;
+            }
+
+            //Prefer devices where the same queue family supports drawing and presentation,
+            //since these have a significantly higher performance (significantly does not mean a lot here, it means significant)
+            if (physicaDeviceGraphicsFamilies[i] == physicaDevicePresentFamilies[i])
             {
                 physicaDeviceScores[i] += 1000;
             }
@@ -685,11 +794,13 @@ void rlglInit(int width, int height)
                 highestScore = physicaDeviceScores[i];
                 physicalDevice = physicalDevices[i];
                 graphicsFamily = physicaDeviceGraphicsFamilies[i];
+                presentFamily = physicaDevicePresentFamilies[i];
             }
         }
 
         RL_FREE(physicalDevices);
         RL_FREE(physicaDeviceScores);
+        RL_FREE(physicaDevicePresentFamilies);
         RL_FREE(physicaDeviceGraphicsFamilies);
     }
 
@@ -701,22 +812,42 @@ void rlglInit(int width, int height)
     
     float queuePriority = 1.0f;
 
-    VkDeviceQueueCreateInfo queueCreateInfo =
+    VkDeviceQueueCreateInfo graphicsQueueCreateInfo =
     {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = graphicsFamily,
         .queueCount = 1,
         .pQueuePriorities = &queuePriority
     };
+
+    VkDeviceQueueCreateInfo presentQueueCreateInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = presentFamily,
+        .queueCount = 1,
+        .pQueuePriorities = &queuePriority
+    };
     
+    VkDeviceQueueCreateInfo queueCreateInfos[] =
+    {
+        graphicsQueueCreateInfo,
+        presentQueueCreateInfo
+    };
+
+    //If the present family and the graphics family the same we don't need to create seperate queues,
+    //because the families are not seperate
+    uint32_t queuesToCreate = presentFamily == graphicsFamily ? 1 : 2;
+
     VkPhysicalDeviceFeatures deviceFeatures = { 0 };
 
     VkDeviceCreateInfo deviceCreateInfo = 
     {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pQueueCreateInfos = &queueCreateInfo,
-        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = queueCreateInfos,
+        .queueCreateInfoCount = queuesToCreate,
         .pEnabledFeatures = &deviceFeatures,
+        .enabledExtensionCount = requiredDeviceExtensionCount,
+        .ppEnabledExtensionNames = requiredDeviceExtensions,
 #ifdef RLVK_ENABLE_VULKAN_VALIDATION_LAYER
         .enabledLayerCount = 1,
         .ppEnabledLayerNames = validationLayers
@@ -733,10 +864,516 @@ void rlglInit(int width, int height)
 
     VkQueue graphicsQueue;
     vkGetDeviceQueue(RLVK.device, graphicsFamily, 0, &graphicsQueue);
+
+    VkQueue presentQueue;
+    vkGetDeviceQueue(RLVK.device, presentFamily, 0, &presentQueue);
+
+    VkExtent2D swapExtent;
+    VkFormat swapChainImageFormat;
+    
+    {
+        VkSurfaceCapabilitiesKHR capabilities;
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, RLVK.surface, &capabilities);
+
+        if (capabilities.currentExtent.width != UINT32_MAX)
+        {
+            swapExtent = capabilities.currentExtent;
+        }
+        else
+        {
+            VkExtent2D actualExtent = { (uint32_t)width, (uint32_t)height };
+
+            //Clamp
+            if (actualExtent.width < capabilities.minImageExtent.width)
+            {
+                actualExtent.width = capabilities.minImageExtent.width;
+            }
+
+            if (actualExtent.width > capabilities.maxImageExtent.width)
+            {
+                actualExtent.width = capabilities.maxImageExtent.width;
+            }
+
+            //Clamp
+            if (actualExtent.height < capabilities.minImageExtent.height)
+            {
+                actualExtent.height = capabilities.minImageExtent.height;
+            }
+
+            if (actualExtent.width > capabilities.maxImageExtent.height)
+            {
+                actualExtent.height = capabilities.maxImageExtent.height;
+            }
+
+            swapExtent = actualExtent;
+        }
+
+        RLVK.swapChainImageCount = capabilities.minImageCount + 1;
+
+        if (capabilities.maxImageCount > 0 && RLVK.swapChainImageCount > capabilities.maxImageCount)
+        {
+            RLVK.swapChainImageCount = capabilities.maxImageCount;
+        }
+
+        uint32_t formatCount;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, RLVK.surface, &formatCount, 0);
+
+        VkSurfaceFormatKHR surfaceFormat;
+        VkSurfaceFormatKHR* formats = RL_MALLOC(formatCount * sizeof(VkSurfaceFormatKHR));
+        vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, RLVK.surface, &formatCount, formats);
+
+        bool foundAvailableFormat = false;
+
+        for (uint32_t i = 0; i < formatCount; ++i)
+        {
+            VkSurfaceFormatKHR* availableFormat = &formats[i];
+
+            if (availableFormat->format == VK_FORMAT_B8G8R8A8_SRGB && availableFormat->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            {
+                foundAvailableFormat = true;
+                surfaceFormat = *availableFormat;
+                break;
+            }
+        }
+
+        if (!foundAvailableFormat)
+        {
+            surfaceFormat = formats[0];
+        }
+
+        RL_FREE(formats);
+
+        uint32_t presentModeCount;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, RLVK.surface, &presentModeCount, 0);
+
+        VkPresentModeKHR presentMode;
+        VkPresentModeKHR* presentModes = 0;
+        presentModes = RL_MALLOC(presentModeCount * sizeof(VkPresentModeKHR));
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, RLVK.surface, &presentModeCount, presentModes);
+
+        /* Note for people that are new to Vulkan:
+            - VK_PRESENT_MODE_IMMEDIATE_KHR: No VSync
+            - VK_PRESENT_MODE_FIFO_KHR: There is a queue of the drawn frames and the GPU will just display those frames in VSync timing,
+                if the queue is full, the CPU is blocked and it has to wait for the GPU
+            - VK_PRESENT_MODE_MAILBOX_KHR: There is a queue of the drawn frames which the GPU will display in a VSync timing,
+                if the queue is full, the oldest frame is discraded and the newest frame is inserted
+
+            VK_PRESENT_MODE_FIFO_KHR is guarenteed to be available on every system.
+        */
+
+        bool foundAvailablePresentMode = false;
+
+        for (uint32_t i = 0; i < presentModeCount; ++i)
+        {
+            VkPresentModeKHR availablePresentMode = presentModes[i];
+
+            if (RLVK.vSync && availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR)
+            {
+                presentMode = availablePresentMode;
+                break;
+            }
+
+            if (!RLVK.vSync && availablePresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+            {
+                presentMode = availablePresentMode;
+                break;
+            }
+        }
+        
+        if (!foundAvailablePresentMode)
+        {
+            presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        }
+        
+        RL_FREE(presentModes);
+
+        swapChainImageFormat = surfaceFormat.format;
+
+        VkSwapchainCreateInfoKHR createInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .surface = RLVK.surface,
+            .minImageCount = RLVK.swapChainImageCount,
+            .imageFormat = surfaceFormat.format,
+            .imageColorSpace = surfaceFormat.colorSpace,
+            .imageExtent = swapExtent,
+            .imageArrayLayers = 1,
+            .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .preTransform = capabilities.currentTransform,
+            .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            .presentMode = presentMode,
+            .clipped = VK_TRUE,
+            .oldSwapchain = VK_NULL_HANDLE
+        };
+        
+        uint32_t queueFamilyIndices[] = { graphicsFamily, presentFamily };
+
+        if (graphicsFamily != presentFamily)
+        {
+            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+            createInfo.queueFamilyIndexCount = 2;
+            createInfo.pQueueFamilyIndices = queueFamilyIndices;
+        }
+        else
+        {
+            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            createInfo.queueFamilyIndexCount = 0;
+            createInfo.pQueueFamilyIndices = 0;
+        }
+
+        if (vkCreateSwapchainKHR(RLVK.device, &createInfo, 0, &RLVK.swapChain) != VK_SUCCESS)
+        {
+            TRACELOG(LOG_WARNING, "Vulkan: Failed to create a swap chain");
+            return;
+        }
+    }
+
+    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapChain, &RLVK.swapChainImageCount, 0);
+
+    VkImage* swapChainImages = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkImage));
+    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapChain, &RLVK.swapChainImageCount, swapChainImages);
+
+    RLVK.swapChainImageViews = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkImageView));
+
+    for (uint32_t i = 0; i < RLVK.swapChainImageCount; ++i)
+    {
+        VkImageViewCreateInfo createInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = swapChainImages[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = swapChainImageFormat,
+            .components.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .components.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .components.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .components.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+            .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .subresourceRange.baseMipLevel = 0,
+            .subresourceRange.levelCount = 1,
+            .subresourceRange.baseArrayLayer = 0,
+            .subresourceRange.layerCount = 1
+        };
+
+        if (vkCreateImageView(RLVK.device, &createInfo, 0, &RLVK.swapChainImageViews[i]) != VK_SUCCESS)
+        {
+            TRACELOG(LOG_WARNING, "Vulkan: Failed to create an image view");
+            return;
+        }
+    }
+
+    VkAttachmentDescription colorAttachment =
+    {
+        .format = swapChainImageFormat,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+    };
+
+    VkAttachmentReference colorAttachmentRef =
+    {
+        .attachment = 0,
+        .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    };
+
+    VkSubpassDescription subpass =
+    {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colorAttachmentRef
+    };
+
+    VkRenderPassCreateInfo renderPassInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &colorAttachment,
+        .subpassCount = 1,
+        .pSubpasses = &subpass
+    };
+
+    if (vkCreateRenderPass(RLVK.device, &renderPassInfo, 0, &RLVK.renderPass) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create render pass");
+        return;
+    }
+    
+    const char defaultVShaderCode[] =
+    "#version 450                       \n"
+    "vec2 positions[3] = vec2[]         \n"
+    "(                                  \n"
+    "   vec2(0.0, -0.5),                \n"
+    "   vec2(0.5, 0.5),                 \n"
+    "   vec2(-0.5, 0.5)                 \n"
+    ");                                 \n"
+    "void main()                        \n"
+    "{                                  \n"
+    "    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0); \n"
+    "}\n\0";
+
+    const char defaultFShaderCode[] =
+    "#version 450                       \n"
+    "layout(location = 0) out vec4 outColor; \n"
+    "void main()                        \n"
+    "{                                  \n"
+    "    outColor = vec4(1.0, 0.0, 0.0, 1.0); \n"
+    "}\n\0";
+
+    shaderc_compiler_t shaderCompiler = shaderc_compiler_initialize();
+    shaderc_compile_options_t shaderCompileOptions = shaderc_compile_options_initialize();
+
+    //TODO: Set compile options
+
+    //TODO: Preprocess shader text?
+
+    shaderc_compilation_result_t vsCompileResult =
+        shaderc_compile_into_spv(shaderCompiler, defaultVShaderCode, strlen(defaultVShaderCode), shaderc_vertex_shader, 
+        "DefaultVertexShader", "main", shaderCompileOptions);
+
+    if (shaderc_result_get_compilation_status(vsCompileResult) != shaderc_compilation_status_success)
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Failed to compile default vertex shader: %s", shaderc_result_get_error_message(vsCompileResult));
+        return;
+    }
+
+    size_t vsSpirVLength = shaderc_result_get_length(vsCompileResult);
+    uint32_t* vsSpirvVBinary = (uint32_t*)shaderc_result_get_bytes(vsCompileResult);
+
+    VkShaderModuleCreateInfo vertexShaderCreateInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = vsSpirVLength,
+        .pCode = vsSpirvVBinary
+    };
+
+    VkShaderModule vertexShaderModule;
+    if (vkCreateShaderModule(RLVK.device, &vertexShaderCreateInfo, 0, &vertexShaderModule) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create vertex shader module");
+        return;
+    }
+
+    shaderc_result_release(vsCompileResult);
+
+    shaderc_compilation_result_t fsCompileResult =
+        shaderc_compile_into_spv(shaderCompiler, defaultFShaderCode, strlen(defaultFShaderCode), shaderc_fragment_shader, 
+        "DefaultFragmentShader", "main", shaderCompileOptions);
+
+    if (shaderc_result_get_compilation_status(fsCompileResult) != shaderc_compilation_status_success)
+    {
+        TRACELOG(LOG_WARNING, "RLVK: Failed to compile default fragment shader: %s", shaderc_result_get_error_message(fsCompileResult));
+        return;
+    }
+
+    size_t fsSpirVLength = shaderc_result_get_length(fsCompileResult);
+    uint32_t* fsSpirvVBinary = (uint32_t*)shaderc_result_get_bytes(fsCompileResult);
+
+    VkShaderModuleCreateInfo fragmentShaderCreateInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = fsSpirVLength,
+        .pCode = fsSpirvVBinary
+    };
+
+    VkShaderModule fragmentShaderModule;
+    if (vkCreateShaderModule(RLVK.device, &fragmentShaderCreateInfo, 0, &fragmentShaderModule) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create fragment shader module");
+        return;
+    }
+    
+    shaderc_result_release(fsCompileResult);
+
+    shaderc_compile_options_release(shaderCompileOptions);
+    shaderc_compiler_release(shaderCompiler);
+
+    VkPipelineShaderStageCreateInfo vertexShaderStageInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = vertexShaderModule,
+        .pName = "main"
+    };
+
+    VkPipelineShaderStageCreateInfo fragmentShaderStageInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .module = fragmentShaderModule,
+        .pName = "main"
+    };
+
+    VkPipelineShaderStageCreateInfo shaderStages[] = { vertexShaderStageInfo, fragmentShaderStageInfo };
+
+    VkDynamicState dynamicStates[] =
+    {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR
+    };
+
+    VkPipelineDynamicStateCreateInfo dynamicState =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = sizeof(dynamicStates) / sizeof(dynamicStates[0]),
+        .pDynamicStates = dynamicStates
+    };
+
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions = 0, //Optional
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions = 0 //Optional
+    };
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .primitiveRestartEnable = VK_FALSE
+    };
+
+    VkViewport viewport =
+    {
+        .x = 0.0f,
+        .y = 0.0f,
+        .width = (float)swapExtent.width,
+        .height = (float)swapExtent.height,
+        .minDepth = 0.0f,
+        .maxDepth = 1.0f
+    };
+
+    VkRect2D scissor =
+    {
+        .offset = { 0, 0 },
+        .extent = swapExtent
+    };
+
+    VkPipelineViewportStateCreateInfo viewportState =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .pViewports = &viewport,
+        .scissorCount = 1,
+        .pScissors = &scissor
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterizer =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .depthClampEnable = VK_FALSE,
+        .rasterizerDiscardEnable = VK_FALSE,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .lineWidth = 1.0f,
+        .cullMode = VK_CULL_MODE_BACK_BIT,
+        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+        .depthBiasEnable = VK_FALSE,
+        .depthBiasConstantFactor = 0.0f, //Optional
+        .depthBiasClamp = 0.0f, //Optional
+        .depthBiasSlopeFactor = 0.0f //Optional
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .sampleShadingEnable = VK_FALSE,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .minSampleShading = 1.0f, //Optional
+        .pSampleMask = 0, //Optional
+        .alphaToCoverageEnable = VK_FALSE, //Optional
+        .alphaToOneEnable = VK_FALSE //Optional
+    };
+    
+    VkPipelineColorBlendAttachmentState colorBlendAttachment =
+    {
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD
+    };
+
+    VkPipelineColorBlendStateCreateInfo colorBlending =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .logicOpEnable = VK_FALSE,
+        .logicOp = VK_LOGIC_OP_COPY, //Optional
+        .attachmentCount = 1,
+        .pAttachments = &colorBlendAttachment,
+        .blendConstants[0] = 0.0f, //Optional
+        .blendConstants[1] = 0.0f, //Optional
+        .blendConstants[2] = 0.0f, //Optional
+        .blendConstants[3] = 0.0f, //Optional
+    };
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0, //Optional
+        .pSetLayouts = 0, //Optional
+        .pushConstantRangeCount = 0, //Optional
+        .pPushConstantRanges = 0, //Optional
+    };
+
+    if (vkCreatePipelineLayout(RLVK.device, &pipelineLayoutInfo, 0, &RLVK.pipelineLayout) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create pipeline layout");
+        return;
+    }
+
+    VkGraphicsPipelineCreateInfo pipelineInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2,
+        .pStages = shaderStages,
+        .pVertexInputState = &vertexInputInfo,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState = &viewportState,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState = &multisampling,
+        .pDepthStencilState = 0, //Optional
+        .pColorBlendState = &colorBlending,
+        .pDynamicState = &dynamicState,
+        .layout = RLVK.pipelineLayout,
+        .renderPass = RLVK.renderPass,
+        .subpass = 0,
+        .basePipelineHandle = VK_NULL_HANDLE, //Optional
+        .basePipelineIndex = -1 //Optional
+    };
+
+    if (vkCreateGraphicsPipelines(RLVK.device, VK_NULL_HANDLE, 1, &pipelineInfo, 0, &RLVK.graphicsPipeline) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create graphics pipeline");
+        return;
+    }
+
+    vkDestroyShaderModule(RLVK.device, vertexShaderModule, 0);
+    vkDestroyShaderModule(RLVK.device, fragmentShaderModule, 0);
+    
+
+    RLVK.inited = true;
 }
 
 void rlglClose(void)
 {
+    vkDestroyPipeline(RLVK.device, RLVK.graphicsPipeline, 0);
+    vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, 0);
+    vkDestroyRenderPass(RLVK.device, RLVK.renderPass, 0);
+
+    for (uint32_t i = 0; i < RLVK.swapChainImageCount; ++i)
+    {
+        vkDestroyImageView(RLVK.device, RLVK.swapChainImageViews[i], 0);
+    }
+    
+    vkDestroySwapchainKHR(RLVK.device, RLVK.swapChain, 0);
+    vkDestroySurfaceKHR(RLVK.vkInstance, RLVK.surface, 0);
     vkDestroyDevice(RLVK.device, 0);
 
 #ifdef RLVK_ENABLE_VULKAN_VALIDATION_LAYER
@@ -1184,7 +1821,12 @@ void rlSwapScreenBuffers(void)
 
 void rlSetVSync(bool enable)
 {
+    RLVK.vSync = enable;
 
+    if (RLVK.inited)
+    {
+        //TODO
+    }
 }
 
 #endif

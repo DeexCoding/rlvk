@@ -213,6 +213,11 @@
                                     // NOTE: Vulkan HAS TO be included either before GLFW or by GLFW for
                                     //       the vulkan GLFW extensions to work properly
 
+    // NOTE: For linking up Vulkan surface with the OS's window the API is pretty weird, there needs to be sperate headers included
+    #if defined(_WIN32)
+        #define VK_USE_PLATFORM_WIN32_KHR
+    #endif
+
     #include "GLFW/glfw3.h"         // GLFW3 library: Windows, OpenGL context and Input management
                                     // NOTE: GLFW3 already includes gl.h (OpenGL) headers
 
@@ -4735,7 +4740,7 @@ static bool InitGraphicsDevice(int width, int height)
 
     // Initialize OpenGL context (states and resources)
     // NOTE: CORE.Window.currentFbo.width and CORE.Window.currentFbo.height not used, just stored as globals in rlgl
-    rlglInit(CORE.Window.currentFbo.width, CORE.Window.currentFbo.height);
+    rlglInit(CORE.Window.currentFbo.width, CORE.Window.currentFbo.height, CORE.Window.handle);
 
     // Setup default viewport
     // NOTE: It updated CORE.Window.render.width and CORE.Window.render.height
