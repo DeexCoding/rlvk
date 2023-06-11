@@ -2148,6 +2148,8 @@ void BeginDrawing(void)
     CORE.Time.update = CORE.Time.current - CORE.Time.previous;
     CORE.Time.previous = CORE.Time.current;
 
+    rlBeginFrame();
+
     rlLoadIdentity();                   // Reset current matrix (modelview)
     rlMultMatrixf(MatrixToFloat(CORE.Window.screenScale)); // Apply screen scaling
 
@@ -2218,6 +2220,8 @@ void EndDrawing(void)
         rlDrawRenderBatchActive();  // Update and draw internal render batch
     }
 #endif
+
+    rlEndFrame();
 
 #if !defined(SUPPORT_CUSTOM_FRAME_CONTROL)
     SwapScreenBuffer();                  // Copy back buffer to front buffer (screen)

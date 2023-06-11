@@ -172,15 +172,29 @@ typedef struct rlvkData {
 #endif
     VkSurfaceKHR surface;
     VkDevice device;
+    VkQueue graphicsQueue;
+    VkQueue presentQueue;
     VkSwapchainKHR swapChain;
+    VkExtent2D swapChainExtent;
     uint32_t swapChainImageCount;
+    VkImage* swapChainImages;
     VkImageView* swapChainImageViews;
     VkRenderPass renderPass;
     VkPipelineLayout pipelineLayout;
     VkPipeline graphicsPipeline;
+    VkFramebuffer* swapChainFramebuffers;
+    VkViewport viewport;
+    VkRect2D scissor;
+    VkCommandPool commandPool;
+    VkCommandBuffer commandBuffer;
+    uint32_t imageIndex;
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
+    VkFence inFlightFence;
 
     //-----------
 
+    VkClearColorValue clearColor;
     rlRenderBatch *currentBatch;            // Current render batch
     //rlRenderBatch defaultBatch;             // Default internal render batch
 
@@ -862,13 +876,9 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
         return;
     }
 
-    VkQueue graphicsQueue;
-    vkGetDeviceQueue(RLVK.device, graphicsFamily, 0, &graphicsQueue);
+    vkGetDeviceQueue(RLVK.device, graphicsFamily, 0, &RLVK.graphicsQueue);
+    vkGetDeviceQueue(RLVK.device, presentFamily, 0, &RLVK.presentQueue);
 
-    VkQueue presentQueue;
-    vkGetDeviceQueue(RLVK.device, presentFamily, 0, &presentQueue);
-
-    VkExtent2D swapExtent;
     VkFormat swapChainImageFormat;
     
     {
@@ -877,7 +887,7 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
 
         if (capabilities.currentExtent.width != UINT32_MAX)
         {
-            swapExtent = capabilities.currentExtent;
+            RLVK.swapChainExtent = capabilities.currentExtent;
         }
         else
         {
@@ -905,7 +915,7 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
                 actualExtent.height = capabilities.maxImageExtent.height;
             }
 
-            swapExtent = actualExtent;
+            RLVK.swapChainExtent = actualExtent;
         }
 
         RLVK.swapChainImageCount = capabilities.minImageCount + 1;
@@ -924,11 +934,20 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
 
         bool foundAvailableFormat = false;
 
+        if (formatCount == 1 && formats[0].format == VK_FORMAT_UNDEFINED)
+        {
+            //This means we can choose any format
+			surfaceFormat.format = VK_FORMAT_R8G8B8A8_UNORM;
+            surfaceFormat.colorSpace = formats[0].colorSpace; //TODO: Idk what to put here lol
+		}
+
         for (uint32_t i = 0; i < formatCount; ++i)
         {
             VkSurfaceFormatKHR* availableFormat = &formats[i];
 
-            if (availableFormat->format == VK_FORMAT_B8G8R8A8_SRGB && availableFormat->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            //For SRGB
+            //if (availableFormat->format == VK_FORMAT_B8G8R8A8_SRGB && availableFormat->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            if (availableFormat->format == VK_FORMAT_R8G8B8A8_UNORM)
             {
                 foundAvailableFormat = true;
                 surfaceFormat = *availableFormat;
@@ -996,7 +1015,7 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
             .minImageCount = RLVK.swapChainImageCount,
             .imageFormat = surfaceFormat.format,
             .imageColorSpace = surfaceFormat.colorSpace,
-            .imageExtent = swapExtent,
+            .imageExtent = RLVK.swapChainExtent,
             .imageArrayLayers = 1,
             .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             .preTransform = capabilities.currentTransform,
@@ -1030,8 +1049,8 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
 
     vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapChain, &RLVK.swapChainImageCount, 0);
 
-    VkImage* swapChainImages = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkImage));
-    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapChain, &RLVK.swapChainImageCount, swapChainImages);
+    RLVK.swapChainImages = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkImage));
+    vkGetSwapchainImagesKHR(RLVK.device, RLVK.swapChain, &RLVK.swapChainImageCount, RLVK.swapChainImages);
 
     RLVK.swapChainImageViews = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkImageView));
 
@@ -1040,7 +1059,7 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
         VkImageViewCreateInfo createInfo =
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = swapChainImages[i],
+            .image = RLVK.swapChainImages[i],
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
             .format = swapChainImageFormat,
             .components.r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1065,6 +1084,8 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
     {
         .format = swapChainImageFormat,
         .samples = VK_SAMPLE_COUNT_1_BIT,
+        //VK_ATTACHMENT_LOAD_OP_LOAD if we want to load the previous frame
+        //VK_ATTACHMENT_LOAD_OP_CLEAR if we want to clear on frame begin, which can be useful for performance reasons
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -1086,13 +1107,25 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
         .pColorAttachments = &colorAttachmentRef
     };
 
+    VkSubpassDependency dependency =
+    {
+        .srcSubpass = VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask = 0,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    };
+
     VkRenderPassCreateInfo renderPassInfo =
     {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
         .attachmentCount = 1,
         .pAttachments = &colorAttachment,
         .subpassCount = 1,
-        .pSubpasses = &subpass
+        .pSubpasses = &subpass,
+        .dependencyCount = 1,
+        .pDependencies = &dependency
     };
 
     if (vkCreateRenderPass(RLVK.device, &renderPassInfo, 0, &RLVK.renderPass) != VK_SUCCESS)
@@ -1237,29 +1270,29 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
         .primitiveRestartEnable = VK_FALSE
     };
 
-    VkViewport viewport =
+    RLVK.viewport = (VkViewport)
     {
         .x = 0.0f,
         .y = 0.0f,
-        .width = (float)swapExtent.width,
-        .height = (float)swapExtent.height,
+        .width = (float)RLVK.swapChainExtent.width,
+        .height = (float)RLVK.swapChainExtent.height,
         .minDepth = 0.0f,
         .maxDepth = 1.0f
     };
 
-    VkRect2D scissor =
+    RLVK.scissor = (VkRect2D)
     {
         .offset = { 0, 0 },
-        .extent = swapExtent
+        .extent = RLVK.swapChainExtent
     };
 
     VkPipelineViewportStateCreateInfo viewportState =
     {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1,
-        .pViewports = &viewport,
+        .pViewports = &RLVK.viewport,
         .scissorCount = 1,
-        .pScissors = &scissor
+        .pScissors = &RLVK.scissor
     };
 
     VkPipelineRasterizationStateCreateInfo rasterizer =
@@ -1357,12 +1390,99 @@ void rlglInit(int width, int height, struct GLFWwindow* windowHandle)
     vkDestroyShaderModule(RLVK.device, vertexShaderModule, 0);
     vkDestroyShaderModule(RLVK.device, fragmentShaderModule, 0);
     
+    RLVK.swapChainFramebuffers = RL_MALLOC(RLVK.swapChainImageCount * sizeof(VkFramebuffer));
+
+    for (size_t i = 0; i < RLVK.swapChainImageCount; ++i)
+    {
+        VkImageView attachments[] =
+        {
+            RLVK.swapChainImageViews[i]
+        };
+
+        VkFramebufferCreateInfo framebufferInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            .renderPass = RLVK.renderPass,
+            .attachmentCount = 1,
+            .pAttachments = attachments,
+            .width = RLVK.swapChainExtent.width,
+            .height = RLVK.swapChainExtent.height,
+            .layers = 1
+        };
+
+        if (vkCreateFramebuffer(RLVK.device, &framebufferInfo, 0, &RLVK.swapChainFramebuffers[i]) != VK_SUCCESS)
+        {
+            TRACELOG(LOG_WARNING, "Vulkan: Failed to create framebuffer");
+            return;
+        }
+    }
+
+    VkCommandPoolCreateInfo poolInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = graphicsFamily
+    };
+
+    if (vkCreateCommandPool(RLVK.device, &poolInfo, 0, &RLVK.commandPool) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create command pool");
+        return;
+    }
+
+    VkCommandBufferAllocateInfo allocInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = RLVK.commandPool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1
+    };
+
+    if (vkAllocateCommandBuffers(RLVK.device, &allocInfo, &RLVK.commandBuffer) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to allocate command buffer");
+        return;
+    }
+
+    VkSemaphoreCreateInfo semaphoreInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+    };
+
+    VkFenceCreateInfo fenceInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT
+    };
+
+    if (vkCreateSemaphore(RLVK.device, &semaphoreInfo, 0, &RLVK.imageAvailableSemaphore) != VK_SUCCESS ||
+        vkCreateSemaphore(RLVK.device, &semaphoreInfo, 0, &RLVK.renderFinishedSemaphore) != VK_SUCCESS ||
+        vkCreateFence(RLVK.device, &fenceInfo, 0, &RLVK.inFlightFence) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to create semaphores");
+        return;
+    }
 
     RLVK.inited = true;
 }
 
 void rlglClose(void)
 {
+    vkDeviceWaitIdle(RLVK.device);
+
+    vkDestroySemaphore(RLVK.device, RLVK.imageAvailableSemaphore, 0);
+    vkDestroySemaphore(RLVK.device, RLVK.renderFinishedSemaphore, 0);
+    vkDestroyFence(RLVK.device, RLVK.inFlightFence, 0);
+
+    vkDestroyCommandPool(RLVK.device, RLVK.commandPool, 0);
+
+    for (uint32_t i = 0; i < RLVK.swapChainImageCount; ++i)
+    {
+        vkDestroyFramebuffer(RLVK.device, RLVK.swapChainFramebuffers[i], 0);
+    }
+    
+    RL_FREE(RLVK.swapChainFramebuffers);
+
     vkDestroyPipeline(RLVK.device, RLVK.graphicsPipeline, 0);
     vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, 0);
     vkDestroyRenderPass(RLVK.device, RLVK.renderPass, 0);
@@ -1371,6 +1491,8 @@ void rlglClose(void)
     {
         vkDestroyImageView(RLVK.device, RLVK.swapChainImageViews[i], 0);
     }
+
+    RL_FREE(RLVK.swapChainImageViews);
     
     vkDestroySwapchainKHR(RLVK.device, RLVK.swapChain, 0);
     vkDestroySurfaceKHR(RLVK.vkInstance, RLVK.surface, 0);
@@ -1389,6 +1511,99 @@ void rlglClose(void)
 #endif
     
     vkDestroyInstance(RLVK.vkInstance, 0);
+}
+
+void rlBeginFrame(void)
+{
+    vkWaitForFences(RLVK.device, 1, &RLVK.inFlightFence, VK_TRUE, UINT64_MAX);
+    vkResetFences(RLVK.device, 1, &RLVK.inFlightFence);
+
+    vkAcquireNextImageKHR(RLVK.device, RLVK.swapChain, UINT64_MAX, RLVK.imageAvailableSemaphore, VK_NULL_HANDLE, &RLVK.imageIndex);
+
+    vkResetCommandBuffer(RLVK.commandBuffer, 0);
+
+    VkCommandBufferBeginInfo beginInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = 0, //Optional
+        .pInheritanceInfo = 0 //Optional
+    };
+
+    if (vkBeginCommandBuffer(RLVK.commandBuffer, &beginInfo) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to begin recording command buffer");
+        return;
+    }
+
+    VkClearValue clearValue = { 0 };
+
+    VkRenderPassBeginInfo renderPassInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = RLVK.renderPass,
+        .framebuffer = RLVK.swapChainFramebuffers[RLVK.imageIndex],
+        .renderArea.offset = { 0, 0 },
+        .renderArea.extent = RLVK.swapChainExtent,
+
+        //TODO: It is possible to clear screen on render pass begin, this can be useful
+        .clearValueCount = 1,
+        .pClearValues = &clearValue
+    };
+
+    vkCmdBeginRenderPass(RLVK.commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(RLVK.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.graphicsPipeline);
+
+    vkCmdSetViewport(RLVK.commandBuffer, 0, 1, &RLVK.viewport);
+    vkCmdSetScissor(RLVK.commandBuffer, 0, 1, &RLVK.scissor);
+
+}
+
+void rlEndFrame(void)
+{
+    vkCmdEndRenderPass(RLVK.commandBuffer);
+
+    if (vkEndCommandBuffer(RLVK.commandBuffer) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to record command buffer");
+        return;
+    }
+
+    VkSemaphore waitSemaphores[] = { RLVK.imageAvailableSemaphore };
+    VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+    VkSemaphore signalSemaphores[] = { RLVK.renderFinishedSemaphore };
+
+    VkSubmitInfo submitInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = waitSemaphores,
+        .pWaitDstStageMask = waitStages,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &RLVK.commandBuffer,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = signalSemaphores
+    };
+
+    if (vkQueueSubmit(RLVK.graphicsQueue, 1, &submitInfo, RLVK.inFlightFence) != VK_SUCCESS)
+    {
+        TRACELOG(LOG_WARNING, "Vulkan: Failed to submit draw command buffer");
+        return;
+    }
+
+    VkSwapchainKHR swapChains[] = { RLVK.swapChain };
+
+    VkPresentInfoKHR presentInfo =
+    {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = signalSemaphores,
+        .swapchainCount = 1,
+        .pSwapchains = swapChains,
+        .pImageIndices = &RLVK.imageIndex,
+        presentInfo.pResults = 0 //Optional
+    };
+
+    vkQueuePresentKHR(RLVK.presentQueue, &presentInfo);
 }
 
 void rlLoadExtensions(void *loader)
@@ -1415,12 +1630,42 @@ void rlDisableDepthTest(void)
 void rlClearColor(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
     //TODO: Set clear color
+    RLVK.clearColor = (VkClearColorValue)
+    {
+        ((float)r)/255.0f,
+        ((float)g)/255.0f,
+        ((float)b)/255.0f,
+        ((float)a)/255.0f
+    };
 }
 
 
 void rlClearScreenBuffers(void)
 {
-    //TODO: Auctally clear the screen
+    VkImageSubresourceRange subResourceRange =
+    {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1
+    };
+
+    VkClearAttachment clearAttachment =
+    {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .colorAttachment = 0,
+        .clearValue.color = RLVK.clearColor
+    };
+
+    VkClearRect clearRect =
+    {
+        .rect = RLVK.scissor,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+
+    vkCmdClearAttachments(RLVK.commandBuffer, 1, &clearAttachment, 1, &clearRect);
 }
 
 
